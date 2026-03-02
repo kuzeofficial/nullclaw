@@ -190,6 +190,8 @@ pub const TelegramConfig = struct {
     /// Optional SOCKS5/HTTP proxy URL for all Telegram API requests (e.g. "socks5://host:port").
     proxy: ?[]const u8 = null,
     interactive: TelegramInteractiveConfig = .{},
+    /// When true, only respond to messages that @mention the bot (in groups).
+    require_mention: bool = false,
 };
 
 pub const DiscordConfig = struct {

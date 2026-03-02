@@ -447,6 +447,9 @@ pub const TelegramChannel = struct {
     last_update_id: i64,
     proxy: ?[]const u8,
 
+    bot_username: ?[]const u8 = null,
+    require_mention: bool = false,
+
     // Pending media group messages (buffered across poll cycles until group is complete)
     pending_media_messages: std.ArrayListUnmanaged(root.ChannelMessage) = .empty,
     pending_media_group_ids: std.ArrayListUnmanaged(?[]const u8) = .empty,
@@ -500,6 +503,7 @@ pub const TelegramChannel = struct {
         ch.reply_in_private = cfg.reply_in_private;
         ch.proxy = cfg.proxy;
         ch.interactive = cfg.interactive;
+        ch.require_mention = cfg.require_mention;
         return ch;
     }
 
@@ -596,6 +600,84 @@ pub const TelegramChannel = struct {
         const resp = root.http_util.curlPostWithProxy(self.allocator, url, "{}", &.{}, self.proxy, "10") catch return false;
         defer self.allocator.free(resp);
         return std.mem.indexOf(u8, resp, "\"ok\":true") != null;
+    }
+
+    /// Fetch and cache the bot's username from Telegram API.
+    fn fetchBotUsername(self: *TelegramChannel) void {
+        if (self.bot_username != null) return;
+        var url_buf: [512]u8 = undefined;
+        const url = self.apiUrl(&url_buf, "getMe") catch return;
+        const resp = root.http_util.curlPostWithProxy(self.allocator, url, "{}", &.{}, self.proxy, "10") catch return;
+        defer self.allocator.free(resp);
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, resp, .{}) catch return;
+        defer parsed.deinit();
+        if (parsed.value.object.get("result")) |result| {
+            if (result.object.get("username")) |username_val| {
+                if (username_val == .string) {
+                    self.bot_username = self.allocator.dupe(u8, username_val.string) catch null;
+                }
+            }
+        }
+    }
+
+    /// Check if the bot should process this message based on mention requirements.
+    /// In private chats, always returns true.
+    /// In groups, returns true only if:
+    ///   - require_mention is false, OR
+    ///   - the bot is @mentioned in the message
+    pub fn shouldProcessMessage(self: *TelegramChannel, message: std.json.Value) bool {
+        const chat_val = message.object.get("chat") orelse return true;
+        if (chat_val != .object) return true;
+        const chat = chat_val.object;
+        const chat_type_val = chat.get("type") orelse return true;
+        const chat_type = if (chat_type_val == .string) chat_type_val.string else return true;
+
+        // In private chats, always respond
+        if (!std.mem.eql(u8, chat_type, "group") and !std.mem.eql(u8, chat_type, "supergroup")) {
+            return true;
+        }
+
+        // If mention not required in groups, respond
+        if (!self.require_mention) return true;
+
+        // Ensure we have bot username cached
+        self.fetchBotUsername();
+        const bot_name = self.bot_username orelse return true; // Cannot check, allow it
+
+        // Check entities for mention
+        const entities_val = message.object.get("entities") orelse return false;
+        if (entities_val != .array) return false;
+
+        const text_val = message.object.get("text") orelse return false;
+        const text = if (text_val == .string) text_val.string else return false;
+
+        for (entities_val.array.items) |entity| {
+            if (entity != .object) continue;
+
+            const type_val = entity.object.get("type") orelse continue;
+            const entity_type = if (type_val == .string) type_val.string else continue;
+
+            // Check for mention or text_mention
+            if (std.mem.eql(u8, entity_type, "mention")) {
+                const offset_val = entity.object.get("offset") orelse continue;
+                const length_val = entity.object.get("length") orelse continue;
+
+                const offset: usize = if (offset_val == .integer) @intCast(offset_val.integer) else continue;
+                const length: usize = if (length_val == .integer) @intCast(length_val.integer) else continue;
+
+                // Extract the mentioned username (skip the @)
+                if (offset + 1 >= text.len) continue;
+                const end = @min(offset + length, text.len);
+                const mentioned = text[offset + 1..end];
+
+                // Case-insensitive comparison
+                if (std.ascii.eqlIgnoreCase(mentioned, bot_name)) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
     }
 
     /// Register bot commands with Telegram so they appear in the "/" menu.
@@ -1951,6 +2033,12 @@ pub const TelegramChannel = struct {
                 username,
                 user_id orelse "unknown",
             });
+            return;
+        }
+
+        // Check if bot should process this message (require_mention logic)
+        if (!self.shouldProcessMessage(message)) {
+            log.info("ignoring message: require_mention enabled but bot not mentioned", .{});
             return;
         }
 

@@ -54,7 +54,14 @@ const MessageTask = struct {
         task.tg_ptr.startTyping(typing_target) catch {};
         defer task.tg_ptr.stopTyping(typing_target) catch {};
 
-        const reply = task.runtime.session_mgr.processMessage(task.session_key, task.content, null) catch |err| {
+        // Build conversation context for Telegram
+        const conversation_context: ?ConversationContext = .{
+            .channel = "telegram",
+            .is_group = task.is_group,
+            .group_id = if (task.is_group) task.sender else null,
+        };
+
+        const reply = task.runtime.session_mgr.processMessage(task.session_key, task.content, conversation_context) catch |err| {
             log.err("Agent error in worker thread: {}", .{err});
             const err_msg: []const u8 = switch (err) {
                 error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError => "Network error. Please try again.",
@@ -69,9 +76,23 @@ const MessageTask = struct {
         };
         defer allocator.free(reply);
 
-        task.tg_ptr.sendAssistantMessageWithReply(task.sender, task.message_sender_id, task.is_group, reply, task.reply_to_id) catch |err| {
-            log.warn("Send error in worker thread: {}", .{err});
+        // Smart reply: if require_mention is false and in group, check for [NO_REPLY]
+        const should_send = blk: {
+            if (!task.tg_ptr.require_mention and task.is_group) {
+                // Check if AI decided not to reply
+                if (std.mem.indexOf(u8, reply, "[NO_REPLY]") != null) {
+                    log.info("Smart reply: skipping non-essential message", .{});
+                    break :blk false;
+                }
+            }
+            break :blk true;
         };
+
+        if (should_send) {
+            task.tg_ptr.sendAssistantMessageWithReply(task.sender, task.message_sender_id, task.is_group, reply, task.reply_to_id) catch |err| {
+                log.warn("Send error in worker thread: {}", .{err});
+            };
+        }
     }
 
     fn deinit(self: *MessageTask) void {
@@ -578,7 +599,14 @@ pub fn runTelegramLoop(
                 tg_ptr.startTyping(typing_target) catch {};
                 defer tg_ptr.stopTyping(typing_target) catch {};
 
-                const reply = runtime.session_mgr.processMessage(session_key, msg.content, null) catch |err| {
+                // Build conversation context for Telegram
+                const conversation_context: ?ConversationContext = .{
+                    .channel = "telegram",
+                    .is_group = msg.is_group,
+                    .group_id = if (msg.is_group) msg.sender else null,
+                };
+
+                const reply = runtime.session_mgr.processMessage(session_key, msg.content, conversation_context) catch |err| {
                     log.err("Agent error: {}", .{err});
                     const err_msg: []const u8 = switch (err) {
                         error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError => "Network error. Please try again.",
@@ -593,9 +621,23 @@ pub fn runTelegramLoop(
                 };
                 defer allocator.free(reply);
 
-                tg_ptr.sendAssistantMessageWithReply(msg.sender, msg.id, msg.is_group, reply, reply_to_id) catch |err| {
-                    log.warn("Send error: {}", .{err});
+                // Smart reply: if require_mention is false and in group, check for [NO_REPLY]
+                const should_send = blk: {
+                    if (!tg_ptr.require_mention and msg.is_group) {
+                        // Check if AI decided not to reply
+                        if (std.mem.indexOf(u8, reply, "[NO_REPLY]") != null) {
+                            log.info("Smart reply: skipping non-essential message", .{});
+                            break :blk false;
+                        }
+                    }
+                    break :blk true;
                 };
+
+                if (should_send) {
+                    tg_ptr.sendAssistantMessageWithReply(msg.sender, msg.id, msg.is_group, reply, reply_to_id) catch |err| {
+                        log.warn("Send error: {}", .{err});
+                    };
+                }
             }
         }
 
