@@ -419,6 +419,51 @@ pub fn countImageMarkersInLastUser(messages: []const ChatMessage) usize {
     return 0;
 }
 
+/// Strip image markers from messages and return modified copy.
+/// Used when the model does not support vision - images are replaced with placeholder text.
+pub fn stripImageMarkers(arena: std.mem.Allocator, messages: []const ChatMessage) ![]ChatMessage {
+    const result = try arena.alloc(ChatMessage, messages.len);
+
+    var last_user_idx: ?usize = null;
+    for (0..messages.len) |j| {
+        const idx = messages.len - 1 - j;
+        if (messages[idx].role == .user) {
+            last_user_idx = idx;
+            break;
+        }
+    }
+
+    for (messages, 0..) |msg, i| {
+        if (msg.role != .user or i != (last_user_idx orelse messages.len)) {
+            result[i] = msg;
+            continue;
+        }
+
+        const marker_count = countImageMarkersInText(msg.content);
+        if (marker_count == 0) {
+            result[i] = msg;
+            continue;
+        }
+
+        // Keep original content with image markers
+        const note = try std.fmt.allocPrint(
+            arena,
+            "\n[{d} image(s) included as paths - model may not support images]\n",
+            .{marker_count},
+        );
+        const final_content = try std.mem.concat(arena, u8, &.{ msg.content, note });
+        result[i] = .{
+            .role = msg.role,
+            .content = final_content,
+            .name = msg.name,
+            .tool_call_id = msg.tool_call_id,
+            .content_parts = msg.content_parts,
+        };
+    }
+
+    return result;
+}
+
 fn countImageMarkersInText(content: []const u8) usize {
     var count: usize = 0;
     var cursor: usize = 0;

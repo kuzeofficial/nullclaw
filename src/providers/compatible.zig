@@ -598,6 +598,7 @@ pub const OpenAiCompatibleProvider = struct {
         .chat = chatImpl,
         .supportsNativeTools = supportsNativeToolsImpl,
         .supports_vision = supportsVisionImpl,
+        .supports_vision_for_model = supportsVisionForModelImpl,
         .getName = getNameImpl,
         .deinit = deinitImpl,
         .stream_chat = streamChatImpl,
@@ -821,6 +822,12 @@ pub const OpenAiCompatibleProvider = struct {
     }
 
     fn supportsVisionImpl(_: *anyopaque) bool {
+        return true;
+    }
+
+    fn supportsVisionForModelImpl(_: *anyopaque, _: []const u8) bool {
+        // Vision capability is managed by Agent's vision_disabled_models.
+        // Provider assumes all models support vision by default.
         return true;
     }
 
