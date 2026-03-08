@@ -57,6 +57,9 @@ fn safeEnvVarAllowed(key: []const u8) bool {
 /// the sandbox (workspace + allowed_paths). Uses the same validation as
 /// file access: system blocklist always rejects, then workspace and
 /// allowed_paths are checked via realpath canonicalization.
+/// Platform-aware path-list delimiter: `;` on Windows, `:` elsewhere.
+const path_list_delimiter: u8 = if (@import("builtin").os.tag == .windows) ';' else ':';
+
 fn validatePathEnvValue(
     allocator: std.mem.Allocator,
     value: []const u8,
@@ -64,7 +67,7 @@ fn validatePathEnvValue(
     allowed_paths: []const []const u8,
 ) bool {
     if (value.len == 0) return true;
-    var iter = std.mem.splitScalar(u8, value, ':');
+    var iter = std.mem.splitScalar(u8, value, path_list_delimiter);
     while (iter.next()) |component| {
         if (component.len == 0) continue;
         // Must be absolute
@@ -184,8 +187,8 @@ pub const ShellTool = struct {
             }
         }
 
-        // Add path-validated env vars: each colon-separated component
-        // must resolve within workspace or allowed_paths.
+        // Add path-validated env vars: each delimiter-separated component
+        // (`:` on Unix, `;` on Windows) must resolve within workspace or allowed_paths.
         if (self.path_env_vars.len > 0) {
             const ws_resolved: ?[]const u8 = std.fs.cwd().realpathAlloc(allocator, self.workspace_dir) catch null;
             defer if (ws_resolved) |wr| allocator.free(wr);
@@ -636,7 +639,7 @@ test "validatePathEnvValue allows paths within workspace" {
     ));
 }
 
-test "validatePathEnvValue allows colon-separated paths within workspace" {
+test "validatePathEnvValue allows delimiter-separated paths within workspace" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
     const tmp_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
@@ -649,7 +652,7 @@ test "validatePathEnvValue allows colon-separated paths within workspace" {
     const usr_path = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "usr" });
     defer std.testing.allocator.free(usr_path);
 
-    const combined = try std.fmt.allocPrint(std.testing.allocator, "{s}:{s}", .{ lib_path, usr_path });
+    const combined = try std.fmt.allocPrint(std.testing.allocator, "{s}" ++ &[_]u8{path_list_delimiter} ++ "{s}", .{ lib_path, usr_path });
     defer std.testing.allocator.free(combined);
 
     try std.testing.expect(validatePathEnvValue(
@@ -682,10 +685,12 @@ test "validatePathEnvValue rejects paths outside workspace" {
 }
 
 test "validatePathEnvValue rejects system paths" {
+    const system_path = if (@import("builtin").os.tag == .windows) "C:\\Windows\\System32" else "/usr/lib";
+    const fake_ws = if (@import("builtin").os.tag == .windows) "C:\\Users\\test\\workspace" else "/home/user/workspace";
     try std.testing.expect(!validatePathEnvValue(
         std.testing.allocator,
-        "/usr/lib",
-        "/home/user/workspace",
+        system_path,
+        fake_ws,
         &.{},
     ));
 }
@@ -718,8 +723,9 @@ test "validatePathEnvValue rejects mixed valid and invalid paths" {
     const lib_path = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "lib" });
     defer std.testing.allocator.free(lib_path);
 
-    // Mix a valid path with /etc (system-blocked)
-    const combined = try std.fmt.allocPrint(std.testing.allocator, "{s}:/etc", .{lib_path});
+    // Mix a valid path with a system path (blocked)
+    const system_path = if (@import("builtin").os.tag == .windows) "C:\\Windows\\System32" else "/etc";
+    const combined = try std.fmt.allocPrint(std.testing.allocator, "{s}" ++ &[_]u8{path_list_delimiter} ++ "{s}", .{ lib_path, system_path });
     defer std.testing.allocator.free(combined);
 
     try std.testing.expect(!validatePathEnvValue(
@@ -731,19 +737,21 @@ test "validatePathEnvValue rejects mixed valid and invalid paths" {
 }
 
 test "validatePathEnvValue rejects relative paths" {
+    const fake_ws = if (@import("builtin").os.tag == .windows) "C:\\Users\\test\\workspace" else "/home/user/workspace";
     try std.testing.expect(!validatePathEnvValue(
         std.testing.allocator,
         "relative/path",
-        "/home/user/workspace",
+        fake_ws,
         &.{},
     ));
 }
 
 test "validatePathEnvValue allows empty value" {
+    const fake_ws = if (@import("builtin").os.tag == .windows) "C:\\Users\\test\\workspace" else "/home/user/workspace";
     try std.testing.expect(validatePathEnvValue(
         std.testing.allocator,
         "",
-        "/home/user/workspace",
+        fake_ws,
         &.{},
     ));
 }
