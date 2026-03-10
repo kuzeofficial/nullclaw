@@ -1204,7 +1204,7 @@ pub const TelegramChannel = struct {
         text: []const u8,
         reply_to: ?i64,
         reply_markup_json: ?[]const u8,
-    ) error{PartiallySent}!SentMessageMeta {
+    ) !SentMessageMeta {
         const chunks = try buildOutgoingTextChunks(self.allocator, text);
         defer {
             for (chunks) |chunk| chunk.deinit(self.allocator);
