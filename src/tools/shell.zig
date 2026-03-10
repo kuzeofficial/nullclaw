@@ -157,11 +157,38 @@ pub const ShellTool = struct {
 
         // Execute via platform shell
         const proc = @import("process_util.zig");
-        const result = try proc.run(allocator, &.{ platform.getShell(), platform.getShellFlag(), command }, .{
-            .cwd = effective_cwd,
-            .env_map = &env,
-            .max_output_bytes = self.max_output_bytes,
-        });
+        
+        // On Windows, if the command starts with "powershell" or "pwsh", execute it directly via PowerShell
+        // instead of through cmd.exe to avoid pipe interpretation issues
+        const result = if (builtin.os.tag == .windows and isPowerShellCommand(command)) blk: {
+            const ps_info = extractPowerShellCommand(command);
+            var trimmed_ps_cmd = std.mem.trim(u8, ps_info.command, " \t");
+            
+            // Remove outer quotes if present (e.g., "Get-Process | ..." -> Get-Process | ...)
+            if (trimmed_ps_cmd.len >= 2) {
+                const first = trimmed_ps_cmd[0];
+                const last = trimmed_ps_cmd[trimmed_ps_cmd.len - 1];
+                if ((first == '"' and last == '"') or (first == '\'' and last == '\'')) {
+                    trimmed_ps_cmd = trimmed_ps_cmd[1 .. trimmed_ps_cmd.len - 1];
+                }
+            }
+            
+            const full_argv = &.{ ps_info.executable, "-Command", trimmed_ps_cmd };
+            break :blk try proc.run(allocator, full_argv, .{
+                .cwd = effective_cwd,
+                .env_map = &env,
+                .max_output_bytes = self.max_output_bytes,
+            });
+        } else blk: {
+            const shell_cmd = platform.getShell();
+            const shell_flag = platform.getShellFlag();
+            const full_argv = &.{ shell_cmd, shell_flag, command };
+            break :blk try proc.run(allocator, full_argv, .{
+                .cwd = effective_cwd,
+                .env_map = &env,
+                .max_output_bytes = self.max_output_bytes,
+            });
+        };
         defer allocator.free(result.stderr);
 
         if (result.success) {
@@ -190,6 +217,37 @@ pub fn parseStringField(json: []const u8, key: []const u8) ?[]const u8 {
 /// Extract a boolean field value from a JSON blob.
 pub fn parseBoolField(json: []const u8, key: []const u8) ?bool {
     return json_miniparse.parseBoolField(json, key);
+}
+
+/// Check if a command is a PowerShell command (supports both "powershell" and "pwsh").
+fn isPowerShellCommand(command: []const u8) bool {
+    const trimmed = std.mem.trim(u8, command, " \t");
+    return std.ascii.startsWithIgnoreCase(trimmed, "powershell") or 
+           std.ascii.startsWithIgnoreCase(trimmed, "pwsh");
+}
+
+/// Extract PowerShell command info (executable and command string).
+/// Returns a struct with the executable name ("powershell" or "pwsh") and the command part.
+fn extractPowerShellCommand(command: []const u8) struct { executable: []const u8, command: []const u8 } {
+    const trimmed = std.mem.trim(u8, command, " \t");
+    
+    if (std.ascii.startsWithIgnoreCase(trimmed, "powershell")) {
+        return .{ 
+            .executable = "powershell", 
+            .command = trimmed["powershell".len..] 
+        };
+    } else if (std.ascii.startsWithIgnoreCase(trimmed, "pwsh")) {
+        return .{ 
+            .executable = "pwsh", 
+            .command = trimmed["pwsh".len..] 
+        };
+    }
+    
+    // Fallback (should not happen if isPowerShellCommand is used)
+    return .{ 
+        .executable = "powershell", 
+        .command = trimmed 
+    };
 }
 
 /// Extract an integer field value from a JSON blob.
