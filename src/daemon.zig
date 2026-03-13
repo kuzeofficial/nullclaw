@@ -27,6 +27,7 @@ const onboard = @import("onboard.zig");
 const streaming = @import("streaming.zig");
 const ConversationContext = @import("agent/prompt.zig").ConversationContext;
 const thread_stacks = @import("thread_stacks.zig");
+const tunnel_mod = @import("tunnel.zig");
 
 const log = std.log.scoped(.daemon);
 
@@ -55,6 +56,8 @@ pub const DaemonState = struct {
     gateway_port: u16 = 3000,
     components: [MAX_COMPONENTS]?ComponentStatus = .{null} ** MAX_COMPONENTS,
     component_count: usize = 0,
+    tunnel_provider: []const u8 = "none",
+    tunnel_url: ?[]const u8 = null,
 
     pub fn addComponent(self: *DaemonState, name: []const u8) void {
         if (self.component_count < MAX_COMPONENTS) {
@@ -106,6 +109,14 @@ pub fn writeStateFile(allocator: std.mem.Allocator, path: []const u8, state: *co
     try buf.appendSlice(allocator, "{\n");
     try buf.appendSlice(allocator, "  \"status\": \"running\",\n");
     try std.fmt.format(buf.writer(allocator), "  \"gateway\": \"{s}:{d}\",\n", .{ state.gateway_host, state.gateway_port });
+
+    // Tunnel info
+    try std.fmt.format(buf.writer(allocator), "  \"tunnel_provider\": \"{s}\",\n", .{state.tunnel_provider});
+    if (state.tunnel_url) |url| {
+        try std.fmt.format(buf.writer(allocator), "  \"tunnel_url\": \"{s}\",\n", .{url});
+    } else {
+        try buf.appendSlice(allocator, "  \"tunnel_url\": null,\n");
+    }
 
     // Components array
     try buf.appendSlice(allocator, "  \"components\": [\n");
@@ -883,6 +894,46 @@ fn inboundDispatcherThread(
     }
 }
 
+fn startConfiguredTunnel(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+    host: []const u8,
+    port: u16,
+    state: *DaemonState,
+) ?tunnel_mod.Tunnel {
+    if (config.tunnel.provider.len == 0 or std.mem.eql(u8, config.tunnel.provider, "none")) {
+        health.markComponentOk("tunnel");
+        return null;
+    }
+
+    state.addComponent("tunnel");
+
+    var tunnel = tunnel_mod.createTunnel(config.tunnel) catch |err| {
+        state.markError("tunnel", @errorName(err));
+        health.markComponentError("tunnel", @errorName(err));
+        log.warn("Failed to create tunnel: {s}", .{@errorName(err)});
+        return null;
+    } orelse {
+        health.markComponentOk("tunnel");
+        return null;
+    };
+
+    tunnel.allocator = allocator;
+    if (tunnel.start(host, port)) |url| {
+        state.tunnel_provider = config.tunnel.provider;
+        state.tunnel_url = url;
+        state.markRunning("tunnel");
+        health.markComponentOk("tunnel");
+        return tunnel;
+    } else |err| {
+        state.markError("tunnel", @errorName(err));
+        health.markComponentError("tunnel", @errorName(err));
+        log.warn("Failed to start tunnel: {s}", .{@errorName(err)});
+        tunnel.stop();
+        return null;
+    }
+}
+
 /// Run the long-lived runtime. This is the main entry point for `nullclaw gateway`.
 /// Spawns threads for gateway, heartbeat, and channels, then loops until
 /// shutdown is requested (Ctrl+C signal or explicit request).
@@ -916,11 +967,17 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
 
     state.addComponent("scheduler");
 
+    // Start tunnel before gateway so any public URL is available immediately.
+    var tunnel = startConfiguredTunnel(allocator, config, host, port, &state);
+
     var stdout_buf: [4096]u8 = undefined;
     var bw = std.fs.File.stdout().writer(&stdout_buf);
     const stdout = &bw.interface;
     try stdout.print("nullclaw gateway runtime started\n", .{});
     try stdout.print("  Gateway:  http://{s}:{d}\n", .{ state.gateway_host, state.gateway_port });
+    if (state.tunnel_url) |url| {
+        try stdout.print("  Tunnel:   {s} ({s})\n", .{ url, state.tunnel_provider });
+    }
     try stdout.print("  Components: {d} active\n", .{state.component_count});
     try stdout.flush();
     config.printModelConfig();
@@ -1053,6 +1110,11 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
     if (sched_thread) |t| t.join();
     if (hb_thread) |t| t.join();
     gw_thread.join();
+
+    // Stop tunnel if running
+    if (tunnel) |*t| {
+        t.stop();
+    }
 
     try stdout.print("nullclaw gateway runtime stopped.\n", .{});
 }
@@ -2177,4 +2239,96 @@ test "writeStateFile produces valid content" {
     try std.testing.expect(std.mem.indexOf(u8, content, "\"status\": \"running\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "test-comp") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "127.0.0.1:8080") != null);
+}
+
+test "writeStateFile includes tunnel fields" {
+    var state = DaemonState{
+        .started = true,
+        .gateway_host = "127.0.0.1",
+        .gateway_port = 3000,
+        .tunnel_provider = "ngrok",
+        .tunnel_url = "https://test.ngrok-free.app",
+    };
+    state.addComponent("gateway");
+    state.addComponent("tunnel");
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ dir, "daemon_state.json" });
+    defer std.testing.allocator.free(path);
+
+    try writeStateFile(std.testing.allocator, path, &state);
+
+    const file = try std.fs.openFileAbsolute(path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(std.testing.allocator, 4096);
+    defer std.testing.allocator.free(content);
+
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"tunnel_provider\": \"ngrok\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"tunnel_url\": \"https://test.ngrok-free.app\"") != null);
+}
+
+test "writeStateFile handles null tunnel_url" {
+    var state = DaemonState{
+        .started = true,
+        .gateway_host = "127.0.0.1",
+        .gateway_port = 3000,
+        .tunnel_provider = "none",
+        .tunnel_url = null,
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ dir, "daemon_state.json" });
+    defer std.testing.allocator.free(path);
+
+    try writeStateFile(std.testing.allocator, path, &state);
+
+    const file = try std.fs.openFileAbsolute(path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(std.testing.allocator, 4096);
+    defer std.testing.allocator.free(content);
+
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"tunnel_provider\": \"none\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"tunnel_url\": null") != null);
+}
+
+test "startConfiguredTunnel skips none provider" {
+    var config = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var state = DaemonState{};
+
+    const tunnel = startConfiguredTunnel(std.testing.allocator, &config, "127.0.0.1", 3000, &state);
+
+    try std.testing.expect(tunnel == null);
+    try std.testing.expectEqual(@as(usize, 0), state.component_count);
+    try std.testing.expectEqualStrings("none", state.tunnel_provider);
+    try std.testing.expect(state.tunnel_url == null);
+}
+
+test "startConfiguredTunnel records create failure" {
+    var config = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+    };
+    config.tunnel.provider = "ngrok";
+
+    var state = DaemonState{};
+    const tunnel = startConfiguredTunnel(std.testing.allocator, &config, "127.0.0.1", 3000, &state);
+
+    try std.testing.expect(tunnel == null);
+    try std.testing.expectEqual(@as(usize, 1), state.component_count);
+    try std.testing.expectEqualStrings("tunnel", state.components[0].?.name);
+    try std.testing.expect(!state.components[0].?.running);
+    try std.testing.expectEqual(@as(u64, 1), state.components[0].?.restart_count);
+    try std.testing.expectEqualStrings("MissingNgrokConfig", state.components[0].?.last_error.?);
+    try std.testing.expect(state.tunnel_url == null);
 }

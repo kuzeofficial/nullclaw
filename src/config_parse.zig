@@ -1826,6 +1826,58 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (tun.object.get("provider")) |v| {
                 if (v == .string) self.tunnel.provider = try self.allocator.dupe(u8, v.string);
             }
+            // cloudflare sub-config
+            if (tun.object.get("cloudflare")) |cf| {
+                if (cf == .object) {
+                    var cf_cfg = types.CloudflareTunnelConfig{};
+                    if (cf.object.get("token")) |tok| {
+                        if (tok == .string) cf_cfg.token = try self.allocator.dupe(u8, tok.string);
+                    }
+                    self.tunnel.cloudflare = cf_cfg;
+                }
+            }
+            // ngrok sub-config
+            if (tun.object.get("ngrok")) |ng| {
+                if (ng == .object) {
+                    var ng_cfg = types.NgrokTunnelConfig{};
+                    if (ng.object.get("auth_token")) |tok| {
+                        if (tok == .string) ng_cfg.auth_token = try self.allocator.dupe(u8, tok.string);
+                    }
+                    if (ng.object.get("domain")) |dom| {
+                        if (dom == .string) ng_cfg.domain = try self.allocator.dupe(u8, dom.string);
+                    }
+                    self.tunnel.ngrok = ng_cfg;
+                }
+            }
+            // tailscale sub-config
+            if (tun.object.get("tailscale")) |ts| {
+                if (ts == .object) {
+                    var ts_cfg = types.TailscaleTunnelConfig{};
+                    if (ts.object.get("funnel")) |fnl| {
+                        if (fnl == .bool) ts_cfg.funnel = fnl.bool;
+                    }
+                    if (ts.object.get("hostname")) |hn| {
+                        if (hn == .string) ts_cfg.hostname = try self.allocator.dupe(u8, hn.string);
+                    }
+                    self.tunnel.tailscale = ts_cfg;
+                }
+            }
+            // custom sub-config
+            if (tun.object.get("custom")) |cst| {
+                if (cst == .object) {
+                    var cst_cfg = types.CustomTunnelConfig{};
+                    if (cst.object.get("start_command")) |cmd| {
+                        if (cmd == .string) cst_cfg.start_command = try self.allocator.dupe(u8, cmd.string);
+                    }
+                    if (cst.object.get("health_url")) |hu| {
+                        if (hu == .string) cst_cfg.health_url = try self.allocator.dupe(u8, hu.string);
+                    }
+                    if (cst.object.get("url_pattern")) |up| {
+                        if (up == .string) cst_cfg.url_pattern = try self.allocator.dupe(u8, up.string);
+                    }
+                    self.tunnel.custom = cst_cfg;
+                }
+            }
         }
     }
 
