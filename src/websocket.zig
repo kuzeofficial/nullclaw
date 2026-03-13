@@ -241,7 +241,7 @@ pub const WsClient = struct {
         return result;
     }
 
-    /// Read exactly buf.len bytes from TLS.
+    /// Read exactly buf.len bytes from the transport (TLS or plain socket).
     fn readExact(self: *WsClient, buf: []u8) !void {
         var total: usize = 0;
         while (total < buf.len) {
@@ -891,4 +891,52 @@ test "ws buildFrame zero-len payload close" {
     try std.testing.expectEqual(@as(usize, 6), n); // 2 header + 4 mask
     try std.testing.expectEqual(@as(u8, 0x88), buf[0]); // close
     try std.testing.expectEqual(@as(u8, 0x80), buf[1]); // MASK=1, len=0
+}
+
+// Regression: v2026.3.12 applied a blanket `n == 0 → ConnectionClosed` check
+// to both TLS and plain socket paths.  TLS readVec can return 0 transiently
+// (empty TLS records, session tickets, re-keying) without the connection being
+// closed — the old code simply looped.  The fix confines the EOF-by-zero check
+// to the plain-socket branch only.  These tests lock that contract.
+
+test "ws readExact plain returns ConnectionClosed on immediate EOF" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const fds = try std.posix.pipe();
+    std.posix.close(fds[1]); // close write end → read returns 0
+
+    var client = WsClient{
+        .allocator = std.testing.allocator,
+        .stream = .{ .handle = fds[0] },
+        .tls = null,
+        .write_mu = .{},
+    };
+    defer std.posix.close(fds[0]);
+
+    var buf: [1]u8 = undefined;
+    try std.testing.expectError(error.ConnectionClosed, client.readExact(&buf));
+}
+
+test "ws readExact plain reads data then ConnectionClosed on EOF" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const fds = try std.posix.pipe();
+
+    _ = try std.posix.write(fds[1], "OK");
+    std.posix.close(fds[1]);
+
+    var client = WsClient{
+        .allocator = std.testing.allocator,
+        .stream = .{ .handle = fds[0] },
+        .tls = null,
+        .write_mu = .{},
+    };
+    defer std.posix.close(fds[0]);
+
+    // First read succeeds
+    var buf: [2]u8 = undefined;
+    try client.readExact(&buf);
+    try std.testing.expectEqualStrings("OK", &buf);
+
+    // Next read hits EOF
+    var buf2: [1]u8 = undefined;
+    try std.testing.expectError(error.ConnectionClosed, client.readExact(&buf2));
 }
