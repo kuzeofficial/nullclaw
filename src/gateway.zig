@@ -12,6 +12,7 @@
 
 const std = @import("std");
 const build_options = @import("build_options");
+const daemon = @import("daemon.zig");
 const health = @import("health.zig");
 const Config = @import("config.zig").Config;
 const config_types = @import("config_types.zig");
@@ -37,6 +38,7 @@ const MAX_HTTP_REQUEST_SIZE: usize = MAX_HEADER_SIZE + MAX_BODY_SIZE;
 
 /// Request timeout (30s) — prevents slow-loris attacks.
 pub const REQUEST_TIMEOUT_SECS: u64 = 30;
+const ACCEPT_POLL_INTERVAL_MS: u64 = 100;
 
 /// Sliding window for rate limiting (60s).
 pub const RATE_LIMIT_WINDOW_SECS: u64 = 60;
@@ -2698,8 +2700,12 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
 
     // Resolve the listen address
     const addr = try std.net.Address.resolveIp(host, port);
+    const daemon_mode = event_bus != null;
     var server = try addr.listen(.{
         .reuse_address = true,
+        // Daemon/service shutdown needs the accept loop to observe the shared
+        // shutdown flag instead of blocking forever in accept().
+        .force_nonblocking = daemon_mode,
     });
     defer server.deinit();
 
@@ -2725,7 +2731,15 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
 
     // Accept loop — read raw HTTP from TCP connections
     while (true) {
-        var conn = server.accept() catch continue;
+        if (daemon_mode and daemon.isShutdownRequested()) break;
+
+        var conn = server.accept() catch |err| switch (err) {
+            error.WouldBlock => {
+                std.Thread.sleep(ACCEPT_POLL_INTERVAL_MS * std.time.ns_per_ms);
+                continue;
+            },
+            else => continue,
+        };
         defer conn.stream.close();
         configureRequestReadTimeout(&conn.stream);
 

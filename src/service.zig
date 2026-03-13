@@ -717,9 +717,9 @@ fn windowsServiceControlHandler(control: windows.DWORD) callconv(.winapi) void {
     switch (control) {
         SERVICE_CONTROL_STOP, SERVICE_CONTROL_SHUTDOWN => {
             daemon.requestShutdown();
-            updateWindowsServiceStatus(SERVICE_STOP_PENDING, SERVICE_NO_ERROR, 5_000);
-            updateWindowsServiceStatus(SERVICE_STOPPED, SERVICE_NO_ERROR, 0);
-            windows.kernel32.ExitProcess(0);
+            // The control handler should transition to STOP_PENDING and return;
+            // ServiceMain reports STOPPED once the daemon has actually exited.
+            updateWindowsServiceStatus(SERVICE_STOP_PENDING, SERVICE_NO_ERROR, 30_000);
         },
         SERVICE_CONTROL_INTERROGATE => {
             const handle = windows_service_status_handle orelse return;
